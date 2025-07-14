@@ -1,7 +1,10 @@
+import asyncio
 import os
 import random
 import sys
 import warnings
+import socket
+import docker
 
 import torch
 
@@ -37,8 +40,7 @@ from nebula.core.models.fashionmnist.cnn import FashionMNISTModelCNN
 from nebula.core.models.fashionmnist.mlp import FashionMNISTModelMLP
 from nebula.core.models.mnist.cnn import MNISTModelCNN
 from nebula.core.models.mnist.mlp import MNISTModelMLP
-from nebula.core.role import Role
-from nebula.core.noderole import AggregatorNode, IdleNode, MaliciousNode, ServerNode, TrainerNode
+from nebula.core.engine import Engine
 from nebula.core.training.lightning import Lightning
 from nebula.core.training.siamese import Siamese
 
@@ -47,7 +49,7 @@ from nebula.core.training.siamese import Siamese
 # os.environ["TORCHDYNAMO_VERBOSE"] = "1"
 
 
-async def main(config):
+async def main(config: Config):
     """
     Main function to start the NEBULA node.
 
@@ -160,7 +162,7 @@ async def main(config):
         local_test_set_indices=dataset.local_test_indices,
         num_workers=num_workers,
         batch_size=batch_size,
-        samples_per_label = samples_per_label
+        samples_per_label=samples_per_label,
     )
 
     trainer = None
@@ -173,20 +175,6 @@ async def main(config):
         trainer = Siamese
     else:
         raise ValueError(f"Trainer {trainer_str} not supported")
-
-    if config.participant["device_args"]["malicious"]:
-        node_cls = MaliciousNode
-    else:
-        if config.participant["device_args"]["role"] == Role.AGGREGATOR.value:
-            node_cls = AggregatorNode
-        elif config.participant["device_args"]["role"] == Role.TRAINER.value:
-            node_cls = TrainerNode
-        elif config.participant["device_args"]["role"] == Role.SERVER.value:
-            node_cls = ServerNode
-        elif config.participant["device_args"]["role"] == Role.IDLE.value:
-            node_cls = IdleNode
-        else:
-            raise ValueError(f"Role {config.participant['device_args']['role']} not supported")
 
     VARIABILITY = 0.5
 
@@ -212,9 +200,10 @@ async def main(config):
             value = value[key]
         value[keys[-1]] = randomize_value(value[keys[-1]], VARIABILITY)
 
-    logging.info(f"Starting node {idx} with model {model_name}, trainer {trainer.__name__}, and as {node_cls.__name__}")
+    role = config.participant["device_args"]["role"]
+    logging.info(f"Starting node {idx} with model {model_name}, trainer {trainer.__name__}, and as {role}")
 
-    node = node_cls(
+    node = Engine(
         model=model,
         datamodule=datamodule,
         config=config,
@@ -234,21 +223,20 @@ async def main(config):
     if node.cm is not None:
         await node.cm.network_wait()
 
+    # Ensure shutdown is always called and awaited before main() returns
+    if hasattr(node, "shutdown") and callable(node.shutdown):
+        logging.info("Calling node.shutdown() for final cleanup and Docker removal...")
+        await node.shutdown()
+    else:
+        logging.warning("Node does not have a shutdown() method; skipping explicit shutdown.")
+
 
 if __name__ == "__main__":
     config_path = str(sys.argv[1])
     config = Config(entity="participant", participant_config_file=config_path)
-    if sys.platform == "win32" or config.participant["scenario_args"]["deployment"] == "docker":
-        import asyncio
 
+    try:
         asyncio.run(main(config), debug=False)
-    else:
-        try:
-            import uvloop
-
-            uvloop.run(main(config), debug=False)
-        except ImportError:
-            logging.warning("uvloop not available, using default loop")
-            import asyncio
-
-            asyncio.run(main(config), debug=False)
+    except Exception as e:
+        logging.exception(f"Error starting node {config.participant['device_args']['idx']}: {e}")
+        raise e

@@ -7,6 +7,7 @@ import time
 
 import docker
 
+from nebula.core.noderole import factory_role_behavior, change_role_behavior, Role, RoleBehavior
 from nebula.addons.functions import print_msg_box
 from nebula.addons.reporter import Reporter
 from nebula.addons.reputation.reputation import Reputation
@@ -21,6 +22,8 @@ from nebula.core.nebulaevents import (
     RoundStartEvent,
     UpdateNeighborEvent,
     UpdateReceivedEvent,
+    ExperimentFinishEvent,
+    ModelPropagationEvent,
 )
 from nebula.core.network.communications import CommunicationsManager
 from nebula.core.role import Role, factory_node_role
@@ -93,18 +96,11 @@ class Engine:
         self.ip = config.participant["network_args"]["ip"]
         self.port = config.participant["network_args"]["port"]
         self.addr = config.participant["network_args"]["addr"]
-        self.role = config.participant["device_args"]["role"]
-        self.role: Role = factory_node_role(self.role)
+
         self.name = config.participant["device_args"]["name"]
         self.client = docker.from_env()
 
         print_banner()
-
-        print_msg_box(
-            msg=f"Name {self.name}\nRole: {self.role.value}",
-            indent=2,
-            title="Node information",
-        )
 
         self._trainer = None
         self._aggregator = None
@@ -133,6 +129,16 @@ class Engine:
         self._secure_neighbors = []
         self._is_malicious = self.config.participant["adversarial_args"]["attack_params"]["attacks"] != "No Attack"
 
+        role = config.participant["device_args"]["role"]
+        self._role_behavior: RoleBehavior = factory_role_behavior(role, self, config)
+        self._role_behavior_performance_lock = Locker("role_behavior_performance_lock", async_lock=True)
+
+        print_msg_box(
+            msg=f"Name {self.name}\nRole: {self._role_behavior.get_role_name()}",
+            indent=2,
+            title="Node information",
+        )
+
         msg = f"Trainer: {self._trainer.__class__.__name__}"
         msg += f"\nDataset: {self.config.participant['data_args']['dataset']}"
         msg += f"\nIID: {self.config.participant['data_args']['iid']}"
@@ -150,6 +156,7 @@ class Engine:
         self.federation_setup_lock = Locker(name="federation_setup_lock", async_lock=True)
         self.federation_ready_lock = Locker(name="federation_ready_lock", async_lock=True)
         self.round_lock = Locker(name="round_lock", async_lock=True)
+        self._round_in_process_lock = Locker("round_in_process_lock", async_lock=True)
         self.config.reload_config_file()
 
         self._cm = CommunicationsManager(engine=self)
@@ -167,6 +174,8 @@ class Engine:
         # Additional Components
         if "situational_awareness" in self.config.participant:
             self._situational_awareness = SituationalAwareness(self.config, self)
+        else:
+            self._situational_awareness = None
 
         if self.config.participant["defense_args"]["reputation"]["enabled"]:
             self._reputation = Reputation(engine=self, config=self.config)
@@ -190,6 +199,11 @@ class Engine:
     def trainer(self):
         """Trainer"""
         return self._trainer
+
+    @property
+    def rb(self):
+        """Role Behavior"""
+        return self._role_behavior
 
     @property
     def sa(self):
@@ -219,8 +233,10 @@ class Engine:
     def set_initialization_status(self, status):
         self.initialized = status
 
-    def get_round(self):
-        return self.round
+    async def get_round(self):
+        async with self.round_lock:
+            current_round = self.round
+        return current_round
 
     def get_federation_ready_lock(self):
         return self.federation_ready_lock
@@ -325,29 +341,44 @@ class Engine:
 
     async def _control_leadership_transfer_callback(self, source, message):
         logging.info(f"🔧  handle_control_message | Trigger | Received leadership transfer message from {source}")
-        if self.role == Role.AGGREGATOR:
-            neighbors = await self.cm.get_addrs_current_connections(myself=True)
-            if len(neighbors) > 1:
-                random_neighbor = random.choice(neighbors)
-                message = self.cm.create_message("control", "leadership_transfer")
-                await self.cm.send_message(random_neighbor, message)
-                logging.info(
-                    f"🔧  handle_control_message | Trigger | Leadership transfer message sent to {random_neighbor}"
-                )
-                message = self.cm.create_message("control", "leadership_transfer_ack")
-                await self.cm.send_message(source, message)
-                logging.info(f"🔧  handle_control_message | Trigger | Leadership transfer ack message sent to {source}")
-            else:
-                logging.info("🔧  handle_control_message | Trigger | Only one neighbor found, I am the leader")
+
+        if await self._round_in_process_lock.locked_async():
+            logging.info("Learning cycle is executing, role behavior will be modified next round")
+            await self.rb.set_next_role(Role.AGGREGATOR, source_to_notificate=source)
         else:
-            self.role = Role.AGGREGATOR
-            logging.info("🔧  handle_control_message | Trigger | I am now the leader")
-            message = self.cm.create_message("control", "leadership_transfer_ack")
-            await self.cm.send_message(source, message)
-            logging.info(f"🔧  handle_control_message | Trigger | Leadership transfer ack message sent to {source}")
+            try:
+                logging.info("Trying to modify Role behavior")
+                lock_task = asyncio.create_task(self._round_in_process_lock.acquire_async())
+                await asyncio.wait_for(lock_task, timeout=3)
+                self._role_behavior = change_role_behavior(self.rb, Role.AGGREGATOR, self, self.config)
+                await self.rb.set_next_role(Role.AGGREGATOR, source_to_notificate=source)
+                await self.update_self_role()
+                await self._round_in_process_lock.release_async()
+            except TimeoutError:
+                logging.info("Learning cycle is locked, role behavior will be modified next round")
+                await self.rb.set_next_role(Role.AGGREGATOR, source_to_notificate=source)
 
     async def _control_leadership_transfer_ack_callback(self, source, message):
         logging.info(f"🔧  handle_control_message | Trigger | Received leadership transfer ack message from {source}")
+        # No concurrence of difference ack received treated, be aware of that.
+        if await self._round_in_process_lock.locked_async():
+            logging.info("Learning cycle is executing, role behavior will be modified next round")
+            await self.rb.set_next_role(Role.TRAINER)
+        else:
+            try:
+                lock_task = asyncio.create_task(self._round_in_process_lock.acquire_async())
+                await asyncio.wait_for(lock_task, timeout=3)
+
+                logging.info("Role behavior could be executed...")
+                await self.rb.set_next_role(Role.TRAINER)
+                await self.update_self_role()
+
+                await self._round_in_process_lock.release_async()
+
+            except TimeoutError:
+                logging.info("Learning cycle is locked, role behavior will be modified next round")
+                await self.rb.set_next_role(Role.TRAINER)
+
 
     async def _connection_connect_callback(self, source, message):
         logging.info(f"🔗  handle_connection_message | Trigger | Received connection message from {source}")
@@ -372,14 +403,15 @@ class Engine:
 
     async def _federation_federation_models_included_callback(self, source, message):
         logging.info(f"📝  handle_federation_message | Trigger | Received aggregation finished message from {source}")
+        current_round = await self.get_round()
         try:
             await self.cm.get_connections_lock().acquire_async()
-            if self.round is not None and source in self.cm.connections:
+            if current_round is not None and source in self.cm.connections:
                 try:
                     if message is not None and len(message.arguments) > 0:
                         self.cm.connections[source].update_round(int(message.arguments[0])) if message.round in [
-                            self.round - 1,
-                            self.round,
+                            current_round - 1,
+                            current_round,
                         ] else None
                 except Exception as e:
                     logging.exception(f"Error updating round in connection: {e}")
@@ -389,6 +421,22 @@ class Engine:
             logging.exception(f"Error updating round in connection: {e}")
         finally:
             await self.cm.get_connections_lock().release_async()
+
+    async def _reputation_share_callback(self, source, message):
+        try:
+            logging.info(f"handle_reputation_message | Trigger | Received reputation message from {source} | Node: {message.node_id} | Score: {message.score} | Round: {message.round}")
+
+            current_node = self.addr
+            nei = message.node_id
+
+            if hasattr(self, '_reputation') and self._reputation is not None:
+                if current_node != nei:
+                    key = (current_node, nei, message.round)
+                    if key not in self._reputation.reputation_with_all_feedback:
+                        self._reputation.reputation_with_all_feedback[key] = []
+                    self._reputation.reputation_with_all_feedback[key].append(message.score)
+        except Exception as e:
+            logging.exception(f"Error handling reputation message: {e}")
 
     """                                                     ##############################
                                                             #    REGISTERING CALLBACKS   #
@@ -472,9 +520,10 @@ class Engine:
         Sends:
             federation_models_included: A message containing the round number of the aggregation.
         """
-        logging.info(f"🔄  Broadcasting MODELS_INCLUDED for round {self.get_round()}")
+        logging.info(f"🔄  Broadcasting MODELS_INCLUDED for round {await self.get_round()}")
+        current_round = await self.get_round()
         message = self.cm.create_message(
-            "federation", "federation_models_included", [str(arg) for arg in [self.get_round()]]
+            "federation", "federation_models_included", [str(arg) for arg in [current_round]]
         )
         asyncio.create_task(self.cm.send_message_to_neighbors(message))
 
@@ -685,7 +734,10 @@ class Engine:
                 await self.get_federation_ready_lock().acquire_async()
                 if self.config.participant["device_args"]["start"]:
                     logging.info("Propagate initial model updates.")
-                    await self.cm.propagator.propagate("initialization")
+
+                    mpe = ModelPropagationEvent(await self.cm.get_addrs_current_connections(only_direct=True, myself=False), "initialization")
+                    await EventManager.get_instance().publish_node_event(mpe)
+
                     await self.get_federation_ready_lock().release_async()
 
                 self.trainer.set_epochs(epochs)
@@ -711,7 +763,7 @@ class Engine:
         - Logs an error indicating aggregation failure.
 
         This method is called after local training and before proceeding to the next round,
-        ensuring the model is synchronized with the federation’s latest aggregated state.
+        ensuring the model is synchronized with the federation's latest aggregated state.
         """
         logging.info(f"💤  Waiting convergence in round {self.round}.")
         params = await self.aggregator.get_aggregation()
@@ -730,11 +782,54 @@ class Engine:
             title="Round information",
         )
 
-    def learning_cycle_finished(self):
-        if not self.round or not self.total_rounds:
+    async def learning_cycle_finished(self):
+        current_round = await self.get_round()
+        if not current_round or not self.total_rounds:
             return False
         else:
-            return self.round < self.total_rounds
+            return current_round >= self.total_rounds
+
+    async def resolve_missing_updates(self):
+        """
+        Delegates the resolution strategy for missing updates to the current role behavior.
+
+        This function is called when the node receives no model updates from neighbors
+        and needs to apply a fallback strategy depending on its role (e.g., using default weights
+        if aggregator, or local model if trainer).
+
+        Returns:
+            The result of the role-specific resolution strategy.
+        """
+        logging.info(f"Using Role behavior: {self.rb.get_role_name()} conflict resolve strategy")
+        return await self.rb.resolve_missing_updates()
+
+    async def update_self_role(self):
+        """
+        Checks whether a role update is required and performs the transition if necessary.
+
+        If a new role has been assigned (i.e., self.rb.update_role_needed() is True),
+        this function updates the role behavior accordingly and notifies the source
+        that initiated the role transfer, if applicable.
+
+        It logs the role change and spawns an async task to send a control message
+        acknowledging the update to the initiating node.
+
+        Raises:
+            Any exceptions from change_role_behavior or communication logic.
+        """
+        if await self.rb.update_role_needed():
+            logging.info("Starting Role Behavior modification...")
+            from_role = self.rb.get_role_name()
+            next_role = await self.rb.get_next_role()
+            source_to_notificate = await self.rb.get_source_to_notificate()
+            self._role_behavior: RoleBehavior = change_role_behavior(self.rb, next_role, self, self.config)
+            to_role = self.rb.get_role_name()
+            logging.info(f"Role behavior changing from: {from_role} to {to_role}")
+            self.config.participant["device_args"]["role"] = to_role
+            if source_to_notificate:
+                logging.info(f"Sending role modification ACK to transferer: {source_to_notificate}")
+                message = self.cm.create_message("control", "leadership_transfer_ack")
+                asyncio.create_task(self.cm.send_message(source_to_notificate, message))
 
     async def _learning_cycle(self):
         """
@@ -758,48 +853,54 @@ class Engine:
 
         This function blocks (awaits) until the full FL process concludes.
         """
-        # while self.round is not None and self.round < self.total_rounds:
-        while await self._continue_training():
-            current_time = time.time()
-            print_msg_box(
-                msg=f"Round {self.round} of {self.total_rounds - 1} started (max. {self.total_rounds} rounds)",
-                indent=2,
-                title="Round information",
-            )
-            logging.info(f"Federation nodes: {self.federation_nodes}")
-            await self.update_federation_nodes(
-                await self.cm.get_addrs_current_connections(only_direct=True, myself=True)
-            )
-            expected_nodes = await self.get_federation_nodes()
-            rse = RoundStartEvent(self.round, current_time, expected_nodes)
-            await EventManager.get_instance().publish_node_event(rse)
-            self.trainer.on_round_start()
-            logging.info(f"Expected nodes: {expected_nodes}")
-            direct_connections = await self.cm.get_addrs_current_connections(only_direct=True)
-            undirected_connections = await self.cm.get_addrs_current_connections(only_undirected=True)
-            logging.info(f"Direct connections: {direct_connections} | Undirected connections: {undirected_connections}")
-            logging.info(f"[Role {self.role.value}] Starting learning cycle...")
-            await self.aggregator.update_federation_nodes(expected_nodes)
-            await self._extended_learning_cycle()
+        while self.round is not None and self.round < self.total_rounds:
+            async with self._round_in_process_lock:
+                current_time = time.time()
+                print_msg_box(
+                    msg=f"Round {self.round} of {self.total_rounds - 1} started (max. {self.total_rounds} rounds)",
+                    indent=2,
+                    title="Round information",
+                )
 
-            current_time = time.time()
-            ree = RoundEndEvent(self.round, current_time)
-            await EventManager.get_instance().publish_node_event(ree)
+                await self.update_self_role()
 
-            await self.get_round_lock().acquire_async()
+                logging.info(f"Federation nodes: {self.federation_nodes}")
+                await self.update_federation_nodes(
+                    await self.cm.get_addrs_current_connections(only_direct=True, myself=True)
+                )
+                expected_nodes = await self.rb.select_nodes_to_wait()
+                rse = RoundStartEvent(self.round, current_time, expected_nodes)
+                await EventManager.get_instance().publish_node_event(rse)
+                self.trainer.on_round_start()
+                logging.info(f"Expected nodes: {expected_nodes}")
+                direct_connections = await self.cm.get_addrs_current_connections(only_direct=True)
+                undirected_connections = await self.cm.get_addrs_current_connections(only_undirected=True)
 
-            print_msg_box(
-                msg=f"Round {self.round} of {self.total_rounds - 1} finished (max. {self.total_rounds} rounds)",
-                indent=2,
-                title="Round information",
-            )
-            # await self.aggregator.reset()
-            self.trainer.on_round_end()
-            self.round += 1
-            self.config.participant["federation_args"]["round"] = (
-                self.round
-            )  # Set current round in config (send to the controller)
-            await self.get_round_lock().release_async()
+                logging.info(f"Direct connections: {direct_connections} | Undirected connections: {undirected_connections}")
+                logging.info(f"[Role {self.rb.get_role_name()}] Starting learning cycle...")
+
+                await self.aggregator.update_federation_nodes(expected_nodes)
+                async with self._role_behavior_performance_lock:
+                    await self.rb.extended_learning_cycle()
+
+                current_time = time.time()
+                ree = RoundEndEvent(self.round, current_time)
+                await EventManager.get_instance().publish_node_event(ree)
+
+                await self.get_round_lock().acquire_async()
+
+                print_msg_box(
+                    msg=f"Round {self.round} of {self.total_rounds - 1} finished (max. {self.total_rounds} rounds)",
+                    indent=2,
+                    title="Round information",
+                )
+                # await self.aggregator.reset()
+                self.trainer.on_round_end()
+                self.round += 1
+                self.config.participant["federation_args"]["round"] = (
+                    self.round
+                )  # Set current round in config (send to the controller)
+                await self.get_round_lock().release_async()
 
         logging.info(f"[{self.addr}] Training finished at round {self.round}, entering idle mode.")
         # End of the learning cycle
@@ -807,9 +908,18 @@ class Engine:
 
         await self.trainer.test()
 
+        # Shutdown protocol
+        await self._shutdown_protocol()
+
+    async def _shutdown_protocol(self):
+        logging.info("Starting graceful shutdown process...")
+
+        # 1.- Publish Experiment Finish Event to the last update on modules
+        logging.info("Publishing Experiment Finish Event...")
         efe = ExperimentFinishEvent()
         await EventManager.get_instance().publish_node_event(efe)
 
+        # 2.- Log finish message
         print_msg_box(
             msg=f"FL process has been completed successfully (max. {self.total_rounds} rounds reached)",
             indent=2,
@@ -817,13 +927,19 @@ class Engine:
         )
         # Report
         if self.config.participant["scenario_args"]["controller"] != "nebula-test":
-            result = await self.reporter.report_scenario_finished()
-            if result:
-                logging.info("📝  Scenario finished reported succesfully")
-            else:
-                logging.error("📝  Error reporting scenario finished")
+            try:
+                result = await self.reporter.report_scenario_finished()
+                if result:
+                    logging.info("📝  Scenario finished reported successfully")
+                    await self.reporter.stop()
+                else:
+                    logging.error("📝  Error reporting scenario finished")
+            except Exception as e:
+                logging.exception(f"📝  Error during scenario finish report: {e}")
 
-        await asyncio.sleep(5)
+        # Call centralized shutdown
+        await self.shutdown()
+        return
 
         # If it's CAFF, log what should_continue_training() returns
         caff_handler = self._get_caff_handler()
@@ -887,3 +1003,106 @@ class Engine:
 
         # Never train beyond max rounds — not even for CAFF
         return False
+    async def shutdown(self):
+        logging.info("🚦 Engine shutdown initiated")
+
+        # Stop addon services first
+        try:
+            await self._addon_manager.stop_additional_services()
+        except Exception as e:
+            logging.exception("Error stopping add-ons: %s", e)
+
+        # Stop reporter
+        try:
+            await self._reporter.stop()
+        except Exception as e:
+            logging.exception("Error stopping reporter: %s", e)
+
+        # Stop communications manager (includes forwarder, discoverer, propagator, ECS)
+        try:
+            await self.cm.stop()
+        except Exception as e:
+            logging.exception("Error stopping communications manager: %s", e)
+
+        # Stop situational awareness
+        try:
+            if self.sa:
+                await self.sa.stop()
+        except Exception as e:
+            logging.exception("Error stopping situational awareness: %s", e)
+
+        # Task cleanup with improved handling
+        logging.info("Starting graceful task cleanup...")
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+
+        if tasks:
+            logging.info(f"Found {len(tasks)} remaining tasks to clean up")
+            for task in tasks:
+                logging.info(f"  • Task: {task.get_name()} - {task}")
+                logging.info(f"  • State: {task._state} - Done: {task.done()} - Cancelled: {task.cancelled()}")
+
+            # Wait for tasks to complete naturally with shorter timeout
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=3)
+            except asyncio.CancelledError:
+                logging.warning(
+                    "Timeout reached during task cleanup (CancelledError); proceeding with shutdown anyway."
+                )
+                # Do not re-raise, just continue
+            except TimeoutError:
+                logging.warning("Some tasks did not complete in time, forcing cancellation...")
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                # Wait a bit more for cancellations to take effect
+                try:
+                    await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2)
+                except asyncio.CancelledError:
+                    logging.warning(
+                        "Timeout reached during forced cancellation (CancelledError); proceeding with shutdown anyway."
+                    )
+                    # Do not re-raise, just continue
+                except TimeoutError:
+                    logging.warning("Some tasks still not responding to cancellation")
+                    # Final aggressive cleanup - cancel all remaining tasks
+                    remaining_tasks = [
+                        t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()
+                    ]
+                    if remaining_tasks:
+                        logging.warning(f"Forcing cancellation of {len(remaining_tasks)} remaining tasks")
+                        for task in remaining_tasks:
+                            task.cancel()
+                        try:
+                            await asyncio.wait_for(asyncio.gather(*remaining_tasks, return_exceptions=True), timeout=1)
+                        except asyncio.CancelledError:
+                            logging.warning(
+                                "Timeout reached during final forced cancellation (CancelledError); proceeding with shutdown anyway."
+                            )
+                            # Do not re-raise, just continue
+                        except TimeoutError:
+                            logging.exception("Some tasks still not responding to forced cancellation")
+            # Proceed anyway after all cancellation attempts
+            logging.warning("Proceeding with shutdown even if some tasks are still pending/cancelled.")
+        else:
+            logging.info("No remaining tasks to clean up.")
+
+        logging.info("✅ Engine shutdown complete")
+
+        # Kill Docker container if running in Docker
+        if self.config.participant["scenario_args"]["deployment"] == "docker":
+            try:
+                docker_id = socket.gethostname()
+                logging.info(f"📦  Removing docker container with ID {docker_id}")
+                container = self.client.containers.get(docker_id)
+                container.remove(force=True)
+                logging.info(f"📦  Successfully removed docker container {docker_id}")
+            except Exception as e:
+                logging.exception(f"📦  Error removing Docker container {docker_id}: {e}")
+                # Try to force kill the container as last resort
+                try:
+                    import subprocess
+
+                    subprocess.run(["docker", "rm", "-f", docker_id], check=False)
+                    logging.info(f"📦  Forced removal of container {docker_id} via subprocess")
+                except Exception as sub_e:
+                    logging.exception(f"📦  Failed to force remove container {docker_id}: {sub_e}")

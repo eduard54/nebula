@@ -13,6 +13,7 @@ nav:
   - Installation: installation.md
   - User Guide: userguide.md
   - Developer Guide: developerguide.md
+  - Git Workflow: git-workflow.md
   - API Reference: api/
   - Contributing: contributing.md
   - Changelog: changelog.md
