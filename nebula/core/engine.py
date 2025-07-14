@@ -4,10 +4,9 @@ import os
 import random
 import socket
 import time
+
 import docker
 
-from nebula.core.role import Role, factory_node_role
-from nebula.addons.attacks.attacks import create_attack
 from nebula.addons.functions import print_msg_box
 from nebula.addons.reporter import Reporter
 from nebula.addons.reputation.reputation import Reputation
@@ -16,13 +15,15 @@ from nebula.core.aggregation.aggregator import create_aggregator
 from nebula.core.eventmanager import EventManager
 from nebula.core.nebulaevents import (
     AggregationEvent,
+    ExperimentFinishEvent,
+    NodeTerminatedEvent,
     RoundEndEvent,
     RoundStartEvent,
     UpdateNeighborEvent,
     UpdateReceivedEvent,
-    ExperimentFinishEvent,
 )
 from nebula.core.network.communications import CommunicationsManager
+from nebula.core.role import Role, factory_node_role
 from nebula.core.situationalawareness.situationalawareness import SituationalAwareness
 from nebula.core.utils.locker import Locker
 
@@ -37,6 +38,7 @@ import pdb
 import sys
 
 from nebula.config.config import Config
+from nebula.core.aggregation.updatehandlers.caffupdatehandler import CAFFUpdateHandler
 from nebula.core.training.lightning import Lightning
 
 
@@ -117,6 +119,16 @@ class Engine:
 
         self._trainer = trainer(model, datamodule, config=self.config)
         self._aggregator = create_aggregator(config=self.config, engine=self)
+
+        self._termination_sent = False  # <-- needed for CAFF mechanism
+        self._using_caff = self.config.participant.get("communication_args", {}).get("mechanism", "").lower() == "caff"
+        if self._using_caff:
+            logging.info(f"[{self.addr}] Communication mechanism: CAFF")
+        else:
+            logging.info(
+                f"[{self.addr}] Communication mechanism: {self.config.participant.get('communication_args', {}).get('mechanism', 'standard')}"
+            )
+        self._caff_force_terminate = False
 
         self._secure_neighbors = []
         self._is_malicious = self.config.participant["adversarial_args"]["attack_params"]["attacks"] != "No Attack"
@@ -227,6 +239,18 @@ class Engine:
         self.round = new_round
         self.trainer.set_current_round(new_round)
 
+    def _get_caff_handler(self) -> CAFFUpdateHandler | None:
+        if self.config.participant["scenario_args"]["federation"].lower() == "dfl" and self._using_caff:
+            from nebula.core.aggregation.updatehandlers.caffupdatehandler import CAFFUpdateHandler
+
+            handler = getattr(self.aggregator, "_update_storage", None)
+            if isinstance(handler, CAFFUpdateHandler):
+                return handler
+        return None
+
+    def force_stop_training(self):
+        self._caff_force_terminate = True
+
     """                                                     ##############################
                                                             #       MODEL CALLBACKS      #
                                                             ##############################
@@ -314,10 +338,10 @@ class Engine:
                 await self.cm.send_message(source, message)
                 logging.info(f"🔧  handle_control_message | Trigger | Leadership transfer ack message sent to {source}")
             else:
-                logging.info(f"🔧  handle_control_message | Trigger | Only one neighbor found, I am the leader")
+                logging.info("🔧  handle_control_message | Trigger | Only one neighbor found, I am the leader")
         else:
             self.role = Role.AGGREGATOR
-            logging.info(f"🔧  handle_control_message | Trigger | I am now the leader")
+            logging.info("🔧  handle_control_message | Trigger | I am now the leader")
             message = self.cm.create_message("control", "leadership_transfer_ack")
             await self.cm.send_message(source, message)
             logging.info(f"🔧  handle_control_message | Trigger | Leadership transfer ack message sent to {source}")
@@ -710,7 +734,7 @@ class Engine:
         if not self.round or not self.total_rounds:
             return False
         else:
-            return (self.round < self.total_rounds)
+            return self.round < self.total_rounds
 
     async def _learning_cycle(self):
         """
@@ -734,7 +758,8 @@ class Engine:
 
         This function blocks (awaits) until the full FL process concludes.
         """
-        while self.round is not None and self.round < self.total_rounds:
+        # while self.round is not None and self.round < self.total_rounds:
+        while await self._continue_training():
             current_time = time.time()
             print_msg_box(
                 msg=f"Round {self.round} of {self.total_rounds - 1} started (max. {self.total_rounds} rounds)",
@@ -776,6 +801,7 @@ class Engine:
             )  # Set current round in config (send to the controller)
             await self.get_round_lock().release_async()
 
+        logging.info(f"[{self.addr}] Training finished at round {self.round}, entering idle mode.")
         # End of the learning cycle
         self.trainer.on_learning_cycle_end()
 
@@ -799,14 +825,25 @@ class Engine:
 
         await asyncio.sleep(5)
 
-        # Kill itself
-        if self.config.participant["scenario_args"]["deployment"] == "docker":
-            try:
-                docker_id = socket.gethostname()
-                logging.info(f"📦  Killing docker container with ID {docker_id}")
-                self.client.containers.get(docker_id).kill()
-            except Exception as e:
-                logging.exception(f"📦  Error stopping Docker container with ID {docker_id}: {e}")
+        # If it's CAFF, log what should_continue_training() returns
+        caff_handler = self._get_caff_handler()
+        if caff_handler:
+            should_continue = await caff_handler.should_continue_training()
+            logging.info(f"[{self.addr}] CAFF should_continue_training() result: {should_continue}")
+        else:
+            should_continue = False
+            logging.info(f"[{self.addr}] Not using CAFF or not a DFL scenario — proceeding to terminate.")
+
+        if (
+            not caff_handler or not await caff_handler.should_continue_training()
+        ):  # <--- comment out if training to stop as soon as first node reaches finish line
+            if self.config.participant["scenario_args"]["deployment"] == "docker":
+                try:
+                    docker_id = socket.gethostname()
+                    logging.info(f"📦  Killing docker container with ID {docker_id}")
+                    self.client.containers.get(docker_id).kill()
+                except Exception as e:
+                    logging.exception(f"📦  Error stopping Docker container with ID {docker_id}: {e}")
 
     async def _extended_learning_cycle(self):
         """
@@ -814,3 +851,39 @@ class Engine:
         functionalities. The method is called in the _learning_cycle method.
         """
         pass
+
+    async def _continue_training(self):
+        if self.round is None:
+            logging.info("LEAVING LEARNING CYCLE")
+            return False
+
+        # If using CAFF: check if early termination has been triggered
+        if self._using_caff:
+            caff_handler = self._get_caff_handler()
+            if caff_handler:
+                should_continue = await caff_handler.should_continue_training()
+                if not should_continue:
+                    logging.info(f"[{self.addr}] CAFF handler requested early stop. Terminating training.")
+                    # Send termination alert only once
+                    if not self._termination_sent:
+                        await EventManager.get_instance().publish_node_event(NodeTerminatedEvent(self.addr))
+                        terminate_msg = self.cm.create_message("control", "terminated")
+                        await self.cm.send_message_to_neighbors(terminate_msg)
+                        self._termination_sent = True
+                    return False
+
+        # Regular case: keep training if rounds left
+        if self.round < self.total_rounds:
+            return True
+
+        # If max round is reached: send CAFF termination alert only once
+        if self._using_caff:
+            if not self._termination_sent:
+                logging.info("[CAFF] Max rounds reached. Announcing termination to peers.")
+                await EventManager.get_instance().publish_node_event(NodeTerminatedEvent(self.addr))
+                terminate_msg = self.cm.create_message("control", "terminated")
+                await self.cm.send_message_to_neighbors(terminate_msg)
+                self._termination_sent = True
+
+        # Never train beyond max rounds — not even for CAFF
+        return False

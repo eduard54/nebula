@@ -5,7 +5,7 @@ class AddonEvent(ABC):
     """
     Abstract base class for all addon-related events in the system.
     """
-    
+
     @abstractmethod
     async def get_event_data(self):
         """
@@ -21,7 +21,7 @@ class NodeEvent(ABC):
     """
     Abstract base class for all node-related events in the system.
     """
-    
+
     @abstractmethod
     async def get_event_data(self):
         """
@@ -52,7 +52,7 @@ class MessageEvent:
         source (str): Address or identifier of the message sender.
         message (Any): The actual message payload.
     """
-    
+
     def __init__(self, message_type, source, message):
         """
         Initializes a MessageEvent instance.
@@ -142,6 +142,20 @@ class ExperimentFinishEvent(NodeEvent):
 
     async def is_concurrent(self):
         return False
+
+
+class NodeTerminatedEvent(NodeEvent):
+    def __init__(self, source_id: str):
+        self._source_id = source_id
+
+    def __str__(self):
+        return f"NodeTerminatedEvent from {self._source_id}"
+
+    async def get_event_data(self) -> str:
+        return self._source_id
+
+    async def is_concurrent(self) -> bool:
+        return True
 
 
 class AggregationEvent(NodeEvent):
@@ -348,7 +362,7 @@ class GPSEvent(AddonEvent):
     Attributes:
         distances (dict): A dictionary mapping node addresses to their respective distances.
     """
-    
+
     def __init__(self, distances: dict):
         """
         Initializes a GPSEvent.
@@ -379,7 +393,7 @@ class ChangeLocationEvent(AddonEvent):
         latitude (float): New latitude of the node.
         longitude (float): New longitude of the node.
     """
-    
+
     def __init__(self, latitude, longitude):
         """
         Initializes a ChangeLocationEvent.
@@ -402,7 +416,8 @@ class ChangeLocationEvent(AddonEvent):
             tuple: A tuple containing latitude and longitude.
         """
         return (self.latitude, self.longitude)
-    
+
+
 class TestMetricsEvent(AddonEvent):
     def __init__(self, loss, accuracy):
         self._loss = loss

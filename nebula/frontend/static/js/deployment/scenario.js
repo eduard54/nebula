@@ -47,7 +47,6 @@ const ScenarioManager = (function() {
                 start: node.start
             };
         });
-
         // Get topology type from select element
         const topologyType = document.getElementById('predefined-topology-select').value;
 
@@ -131,7 +130,17 @@ const ScenarioManager = (function() {
             schema_additional_participants: document.getElementById("schemaAdditionalParticipantsSelect").value || "random",
             accelerator: "cpu",
             gpu_id: [],
-            physical_ips: physical_ips
+            physical_ips: physical_ips,
+            communication_args: {
+                mechanism: document.querySelector('input[name="mechanism"]:checked')?.value || "standard"
+            },
+            caff_args: {
+                aggregation_fraction: parseFloat(document.getElementById("aggregationFraction")?.value || 0.5),
+                staleness_threshold: parseInt(document.getElementById("stalenessThreshold")?.value || 2)
+            },
+            aggregator_args: {
+                aggregation_timeout: parseInt(document.getElementById("aggregationTimeout")?.value || 60)
+            }
         };
     }
 
@@ -353,16 +362,16 @@ const ScenarioManager = (function() {
     function setPhysicalIPs(ipList = []) {
         physical_ips = [...ipList];
     }
- 
+
     function setActualScenario(index) {
         actual_scenario = index;
         if (scenariosList[index]) {
             // Clear the current graph
             window.TopologyManager.clearGraph();
-            
+
             // Load new scenario data
             loadScenarioData(scenariosList[index]);
-            
+
             // If physical deployment, set physical IPs
             if (scenariosList[index].deployment === 'physical' && scenariosList[index].physical_ips) {
                 window.TopologyManager.setPhysicalIPs(scenariosList[index].physical_ips);
