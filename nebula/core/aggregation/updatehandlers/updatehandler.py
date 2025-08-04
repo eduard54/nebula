@@ -112,11 +112,11 @@ def factory_update_handler(updt_handler, aggregator, addr) -> UpdateHandler:
     from nebula.core.aggregation.updatehandlers.dflupdatehandler import DFLUpdateHandler
     from nebula.core.aggregation.updatehandlers.sdflupdatehandler import SDFLUpdateHandler
 
-    # added by Eduard to choose between communication strategy once DFL is selected
+    # Choose between communication strategy once DFL is selected
     if updt_handler == "DFL":
         mechanism = aggregator.config.participant.get("communication_args", {}).get(
             "mechanism", "standard"
-        )  # strategy can be either standard or CAFF
+        )  # Strategy for DFL can be either standard or CAFF
         if mechanism == "CAFF":
             return CAFFUpdateHandler(aggregator, addr)
         else:

@@ -144,20 +144,6 @@ class ExperimentFinishEvent(NodeEvent):
         return False
 
 
-class NodeTerminatedEvent(NodeEvent):
-    def __init__(self, source_id: str):
-        self._source_id = source_id
-
-    def __str__(self):
-        return f"NodeTerminatedEvent from {self._source_id}"
-
-    async def get_event_data(self) -> str:
-        return self._source_id
-
-    async def is_concurrent(self) -> bool:
-        return True
-
-
 class AggregationEvent(NodeEvent):
     def __init__(self, updates: dict, expected_nodes: set, missing_nodes: set):
         """Event triggered when model aggregation is ready.
